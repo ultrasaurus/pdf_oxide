@@ -6301,6 +6301,8 @@ impl PdfDocument {
     ///
     /// Uses spec-compliant /Artifact tags when available (100% accuracy), or
     /// falls back to heuristic analysis of the top 15% of pages.
+    ///
+    /// See [`remove_artifacts`](Self::remove_artifacts) for guidance on choosing `threshold`.
     pub fn remove_headers(&self, threshold: f32) -> Result<usize> {
         if !(0.0..=1.0).contains(&threshold) {
             return Err(crate::error::Error::InvalidOperation(
@@ -6314,6 +6316,8 @@ impl PdfDocument {
     ///
     /// Uses spec-compliant /Artifact tags when available (100% accuracy), or
     /// falls back to heuristic analysis of the bottom 15% of pages.
+    ///
+    /// See [`remove_artifacts`](Self::remove_artifacts) for guidance on choosing `threshold`.
     pub fn remove_footers(&self, threshold: f32) -> Result<usize> {
         if !(0.0..=1.0).contains(&threshold) {
             return Err(crate::error::Error::InvalidOperation(
@@ -6329,7 +6333,23 @@ impl PdfDocument {
     /// fallback for untagged PDFs.
     ///
     /// # Arguments
-    /// * `threshold` - Fraction of pages (0.0-1.0) where text must repeat to be removed (heuristic mode only).
+    /// * `threshold` - Fraction of pages (0.0-1.0) where text must repeat to be removed.
+    ///
+    ///   "Artifacts" (headers and footers) are detected by repeated patterns
+    ///   of text. The value of `threshold` controls the exact-text-match
+    ///   heuristic (`min_occurrences = ceil(page_count * threshold)`) used for
+    ///   constant header/footer text (brand names, journal titles, etc). It has
+    ///   no effect on page-number/digit detection or the parity-based
+    ///   (recto/verso) constant-fragment detection.
+    ///
+    ///   Low values (e.g. `0.1`) if you notice header/footer elements skipped
+    ///   on some pages (cover pages, section starts) and are not caught; raise
+    ///   it (e.g. `0.3`-`0.5`) if legitimate repeated content — a term that
+    ///   happens to recur near a page's margin — is being stripped. On short
+    ///   documents (under ~10 pages) prefer a higher value, since a low
+    ///   threshold can round down to `min_occurrences == 1`, matching almost
+    ///   anything that merely repeats once. There's no universally correct
+    ///   value; treat it as a per-corpus tunable rather than a fixed constant.
     pub fn remove_artifacts(&self, threshold: f32) -> Result<usize> {
         if !(0.0..=1.0).contains(&threshold) {
             return Err(crate::error::Error::InvalidOperation(
