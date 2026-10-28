@@ -38,6 +38,23 @@ ignore = [
     # 0.3.9. Scoped to the exact version, so every other arrayref
     # release stays fully checked.
     "arrayref@0.3.9",
+
+    # zip 8.6.0 — three advisories against archive extraction to disk:
+    # RUSTSEC-2026-0367 (SUID/SGID bits preserved), RUSTSEC-2026-0368
+    # (symlink targets outside the destination) and RUSTSEC-2026-0369
+    # (permissions applied through symlinks). All three are in
+    # `ZipArchive::extract` / `ZipStreamReader::extract` only. zip is
+    # reached only through office_oxide 0.1.9, which opens OOXML packages
+    # in memory and reads entries; neither it nor pdf_oxide calls either
+    # extract API, so no file is ever written from an archive.
+    #
+    # The fix is zip >= 9.0.0, which needs an office_oxide release built on
+    # it; this release is pinned to office_oxide 0.1.9. Drop these the
+    # moment office_oxide moves to zip 9, or immediately if anything here
+    # starts extracting archives to disk.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]
 
 [licenses]

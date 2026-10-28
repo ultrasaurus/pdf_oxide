@@ -6451,8 +6451,8 @@ impl PdfDocument {
                     let mut work = remaining.clone();
                     for (tok, n) in span_tokens {
                         for _ in 0..*n {
-                            if !take_one(&mut work, tok, allow_fragment)
-                                && !(allow_fragment && take_concatenation(&mut work, tok))
+                            if !(take_one(&mut work, tok, allow_fragment)
+                                || (allow_fragment && take_concatenation(&mut work, tok)))
                             {
                                 return false;
                             }
