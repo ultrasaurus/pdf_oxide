@@ -128,6 +128,207 @@ pub(crate) fn base_heading_font_size(spans: &[&OrderedTextSpan], detect_headings
         .min(12.0)
 }
 
+/// A text line assembled from consecutive reading-order spans on one
+/// baseline: its baseline `y`, horizontal extent, largest font size, and the
+/// index of its first span in the slice it was built from.
+struct ProseLine {
+    y: f32,
+    left: f32,
+    right: f32,
+    size: f32,
+    first: usize,
+}
+
+/// Group reading-order spans into lines: a span starts a new line when its
+/// baseline is half its font size or more away from the current line's, the
+/// same test the converters use for "same line".
+fn prose_lines(spans: &[&OrderedTextSpan]) -> Vec<ProseLine> {
+    let mut lines: Vec<ProseLine> = Vec::new();
+    for (i, s) in spans.iter().enumerate() {
+        if s.span.text.trim().is_empty() || s.span.font_size <= 0.0 {
+            continue;
+        }
+        let (x, y, w, size) = (s.span.bbox.x, s.span.bbox.y, s.span.bbox.width, s.span.font_size);
+        match lines.last_mut() {
+            Some(line) if (y - line.y).abs() < size * 0.5 => {
+                line.left = line.left.min(x);
+                line.right = line.right.max(x + w);
+                line.size = line.size.max(size);
+            },
+            _ => lines.push(ProseLine {
+                y,
+                left: x,
+                right: x + w,
+                size,
+                first: i,
+            }),
+        }
+    }
+    lines
+}
+
+/// Whether two lines' font sizes are within 10% of each other.
+fn same_size(a: &ProseLine, b: &ProseLine) -> bool {
+    (a.size - b.size).abs() <= a.size.max(b.size) * 0.1
+}
+
+/// The right edge of `line`'s column: the furthest right any same-size line
+/// starting at `line`'s left edge (within one font size) reaches. `None`
+/// when fewer than three lines start there, too few to tell a column's edge
+/// from one line's.
+fn column_right(lines: &[ProseLine], line: &ProseLine) -> Option<f32> {
+    let column: Vec<&ProseLine> = lines
+        .iter()
+        .filter(|l| (l.left - line.left).abs() <= line.size && same_size(l, line))
+        .collect();
+    (column.len() >= 3).then(|| column.iter().map(|l| l.right).fold(f32::MIN, f32::max))
+}
+
+/// Fewest wrapped-line gaps that must agree before the page's measured line
+/// pitch replaces the converter's fixed paragraph-gap ratio.
+const MIN_LINE_PITCH_SAMPLES: usize = 4;
+
+/// How much larger than the line pitch a gap must be to separate paragraphs.
+const PARAGRAPH_GAP_OVER_LINE_PITCH: f32 = 1.25;
+
+/// The paragraph-gap ratio (vertical gap ÷ font size) for a page: the
+/// converter's fixed `base` ratio, or, on a page whose lines are at least
+/// `base` font sizes apart, the page's own line pitch scaled by
+/// [`PARAGRAPH_GAP_OVER_LINE_PITCH`].
+///
+/// A fixed ratio assumes text set near single spacing. Double-spaced text,
+/// or a scanned page's text layer whose reported font size is small for its
+/// line spacing, puts every line at least that far apart, and every line
+/// would become its own paragraph. Lines set closer than `base` already
+/// wrap under it, so their pages keep it. The pitch is measured only between
+/// a wrapped line and the line after it — the wrapped line reaches its
+/// [`column_right`] edge — so the gaps after a paragraph's short last line,
+/// and pages of short separated lines, don't count. It is used only when
+/// enough of those gaps agree.
+pub(crate) fn paragraph_gap_ratio(spans: &[&OrderedTextSpan], base: f32) -> f32 {
+    let lines = prose_lines(spans);
+    let mut pitches: Vec<f32> = Vec::new();
+    for pair in lines.windows(2) {
+        let (prev, next) = (&pair[0], &pair[1]);
+        let size = prev.size.max(next.size);
+        let drop = prev.y - next.y;
+        let overlaps = next.left < prev.right && prev.left < next.right;
+        if !same_size(prev, next) || drop < size * 0.5 || !overlaps {
+            continue;
+        }
+        let wraps = column_right(&lines, prev)
+            .is_some_and(|margin| prev.right >= margin - (margin - prev.left) * 0.15);
+        if wraps {
+            pitches.push(drop / size);
+        }
+    }
+    if pitches.len() < MIN_LINE_PITCH_SAMPLES {
+        return base;
+    }
+    pitches.sort_by(f32::total_cmp);
+    let median = pitches[pitches.len() / 2];
+    let agreeing = pitches
+        .iter()
+        .filter(|p| (*p - median).abs() <= median * 0.1)
+        .count();
+    if agreeing * 5 < pitches.len() * 3 || median < base {
+        return base;
+    }
+    median * PARAGRAPH_GAP_OVER_LINE_PITCH
+}
+
+/// Smallest and largest first-line indent, in font sizes, that marks a
+/// paragraph start.
+const FIRST_LINE_INDENT_EMS: std::ops::RangeInclusive<f32> = 0.8..=6.0;
+
+/// Indices into `spans` of the spans that start a paragraph marked only by a
+/// first-line indent, with no extra space above it.
+///
+/// A line is such a start when, against the line before it (same size, below
+/// it):
+/// - it starts [`FIRST_LINE_INDENT_EMS`] to the right of that line,
+/// - that line ends more than two font sizes short of its [`column_right`]
+///   edge (a paragraph's last line), and
+/// - the line after it, if any, returns to that line's left edge.
+///
+/// The last two keep a hanging indent's continuation (it follows a full
+/// line) and an indented block (its next line stays indented) from reading
+/// as paragraph starts.
+pub(crate) fn first_line_indent_starts(
+    spans: &[&OrderedTextSpan],
+) -> std::collections::HashSet<usize> {
+    let lines = prose_lines(spans);
+    let mut starts = std::collections::HashSet::new();
+    for i in 1..lines.len() {
+        let (prev, line) = (&lines[i - 1], &lines[i]);
+        let size = line.size.max(prev.size);
+        if !same_size(prev, line) || prev.y - line.y < size * 0.5 {
+            continue;
+        }
+        if !FIRST_LINE_INDENT_EMS.contains(&((line.left - prev.left) / size)) {
+            continue;
+        }
+        let prev_is_last_line =
+            column_right(&lines, prev).is_some_and(|margin| prev.right < margin - size * 2.0);
+        let next_returns = lines
+            .get(i + 1)
+            .is_none_or(|next| (next.left - prev.left).abs() <= size * 0.5);
+        if prev_is_last_line && next_returns {
+            starts.insert(line.first);
+        }
+    }
+    starts
+}
+
+/// Whether the vertical gap from `previous` to `current` is a paragraph
+/// break: more than `gap_ratio` font sizes, the page's ratio from
+/// [`paragraph_gap_ratio`]. That ratio is measured on lines of one size, so
+/// between spans whose sizes differ by more than 10% (a title over body
+/// text) the converter's fixed `base` ratio applies instead.
+pub(crate) fn exceeds_paragraph_gap(
+    current: &OrderedTextSpan,
+    previous: &OrderedTextSpan,
+    gap_ratio: f32,
+    base: f32,
+) -> bool {
+    let (a, b) = (current.span.font_size, previous.span.font_size);
+    let line_height = a.max(b);
+    let ratio = if (a - b).abs() <= line_height * 0.1 {
+        gap_ratio
+    } else {
+        base
+    };
+    let gap = (previous.span.bbox.y - current.span.bbox.y).abs();
+    gap > line_height * ratio
+}
+
+/// Whether `current` is the line after `prev` in the same column, on a page
+/// whose measured `gap_ratio` (from [`paragraph_gap_ratio`]) is wider than
+/// the converter's fixed `base` ratio: the two are within 10% of each
+/// other's font size (the size the ratio was measured on), and `current`
+/// sits no more than `gap_ratio` font sizes below `prev` and starts left of
+/// where `prev` ends, as a wrapped line does.
+///
+/// XY-cut reading order can cut such a page between any two lines, since
+/// the blank band between widely spaced lines is as wide as the gaps it cuts
+/// at. The resulting group change is not a paragraph boundary.
+pub(crate) fn is_wide_pitch_wrap(
+    prev: &OrderedTextSpan,
+    current: &OrderedTextSpan,
+    gap_ratio: f32,
+    base: f32,
+) -> bool {
+    let (a, b) = (prev.span.font_size, current.span.font_size);
+    if gap_ratio <= base || (a - b).abs() > a.max(b) * 0.1 {
+        return false;
+    }
+    let size = a.max(b);
+    let drop = prev.span.bbox.y - current.span.bbox.y;
+    drop >= size * 0.5
+        && drop <= size * gap_ratio
+        && current.span.bbox.x < prev.span.bbox.x + prev.span.bbox.width
+}
+
 /// Whether a `/Link` annotation URI is safe to emit as a hyperlink.
 ///
 /// Only well-known navigable schemes are allowed; `javascript:`, `data:`,

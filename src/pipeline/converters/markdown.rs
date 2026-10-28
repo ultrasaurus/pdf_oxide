@@ -762,18 +762,22 @@ impl MarkdownOutputConverter {
     /// Detect paragraph breaks between spans based on vertical spacing.
     ///
     /// Two break signals:
-    /// 1. Vertical gap larger than `paragraph_gap_ratio × line_height`
-    ///    (the classic geometric heuristic).
+    /// 1. Vertical gap larger than the page's `gap_ratio` (from
+    ///    [`super::paragraph_gap_ratio`]) × line height, as decided by
+    ///    [`super::exceeds_paragraph_gap`] (the classic geometric heuristic).
     /// 2. The current line begins with a list marker (bullet glyph or
     ///    ordered marker) while the previous line did not — list-items
     ///    must always start a fresh paragraph regardless of how tightly
     ///    they sit under the preceding paragraph (issue #377 D4: many
     ///    untagged docs use a sub-1.5× line gap before lists, which
     ///    glues the first item to the intro sentence).
-    fn is_paragraph_break(&self, current: &OrderedTextSpan, previous: &OrderedTextSpan) -> bool {
-        let line_height = current.span.font_size.max(previous.span.font_size);
-        let gap = (previous.span.bbox.y - current.span.bbox.y).abs();
-        if gap > line_height * self.paragraph_gap_ratio {
+    fn is_paragraph_break(
+        &self,
+        current: &OrderedTextSpan,
+        previous: &OrderedTextSpan,
+        gap_ratio: f32,
+    ) -> bool {
+        if super::exceeds_paragraph_gap(current, previous, gap_ratio, self.paragraph_gap_ratio) {
             return true;
         }
         // List-prefix transition guard. Bullet glyph or `1.` / `a)` /
@@ -1353,6 +1357,8 @@ impl MarkdownOutputConverter {
         // text wins over headings when counts are close. Capped at 12pt
         // so that heading-only documents still produce sensible ratios.
         let base_font_size = super::base_heading_font_size(&sorted, config.output.detect_headings);
+        let gap_ratio = super::paragraph_gap_ratio(&sorted, self.paragraph_gap_ratio);
+        let indent_starts = super::first_line_indent_starts(&sorted);
 
         // Footnote detection (WS2.7). Conservative, high-precision: an
         // inline superscript marker is only rewritten to `[^N]` when a
@@ -1659,8 +1665,11 @@ impl MarkdownOutputConverter {
 
                 // A reading-order group change only forces a paragraph break
                 // when the visual line also changes — this keeps horizontally
-                // split elements (e.g. multi-span footer lines) together.
-                let group_flush = group_changed && !same_line;
+                // split elements (e.g. multi-span footer lines) together —
+                // and is not just the next line of a widely spaced column.
+                let group_flush = group_changed
+                    && !same_line
+                    && !super::is_wide_pitch_wrap(prev, span, gap_ratio, self.paragraph_gap_ratio);
 
                 let prev_was_list_item = matches!(
                     prev.struct_role,
@@ -1691,7 +1700,7 @@ impl MarkdownOutputConverter {
                 // otherwise produce concatenated tokens like
                 // `andmight` from adjacent-column content sharing a
                 // baseline.
-                let column_gap = is_column_gap(prev, span);
+                let column_gap = is_column_gap(prev, span, gap_ratio);
                 let line_truly_continuous = same_line && !column_gap;
                 let block_changed = match (span.block_id, prev.block_id) {
                     (Some(a), Some(b)) => a != b,
@@ -1780,7 +1789,8 @@ impl MarkdownOutputConverter {
                 // block change (the same `<P>` re-entered). It does NOT override
                 // a list-item transition or a real column gutter.
                 let soft_break = group_flush
-                    || self.is_paragraph_break(span, prev)
+                    || self.is_paragraph_break(span, prev, gap_ratio)
+                    || indent_starts.contains(&idx)
                     || heading_changed_break
                     || block_changed;
                 if (soft_break && !merge_wrapped_line) || list_item_changed || column_gap {
@@ -2925,7 +2935,10 @@ fn fence_monospace_blocks(s: &str) -> String {
     out.join("\n\n")
 }
 
-fn is_column_gap(prev: &OrderedTextSpan, current: &OrderedTextSpan) -> bool {
+/// `gap_ratio` is the page's paragraph-gap ratio from
+/// [`super::paragraph_gap_ratio`]: a wrap drops about one line pitch, which
+/// on a widely spaced page is more than two font sizes.
+fn is_column_gap(prev: &OrderedTextSpan, current: &OrderedTextSpan, gap_ratio: f32) -> bool {
     let prev_right = prev.span.bbox.x + prev.span.bbox.width;
     let cur_left = current.span.bbox.x;
     let font_size = current.span.font_size.max(prev.span.font_size).max(1.0);
@@ -2971,7 +2984,7 @@ fn is_column_gap(prev: &OrderedTextSpan, current: &OrderedTextSpan) -> bool {
         // next column resumes at the same height). Only a ~one-line downward
         // step is an ordinary wrap.
         let y_drop = prev.span.bbox.y - current.span.bbox.y;
-        if y_drop > font_size * 0.5 && y_drop < font_size * 2.0 {
+        if y_drop > font_size * 0.5 && y_drop < font_size * gap_ratio.max(2.0) {
             return false; // ordinary line wrap, not a column boundary
         }
         return true;
@@ -3918,7 +3931,7 @@ mod tests {
             let mut prev = prev;
             prev.span.bbox.width = *pw;
             let cur = make_span("c", *cx, 100.0, *font, FontWeight::Normal);
-            let actual = is_column_gap(&prev, &cur);
+            let actual = is_column_gap(&prev, &cur, 1.5);
             assert_eq!(
                 actual, *expected,
                 "(px={}, pw={}, cx={}, font={}) expected {} got {}",
@@ -3940,12 +3953,17 @@ mod tests {
         };
         // Within-column wrap: X resets to the left margin, Y steps down one
         // line (~13.5pt). NOT a column boundary.
-        assert!(!is_column_gap(&mk(285.0, 555.8), &mk(229.0, 542.2)));
+        assert!(!is_column_gap(&mk(285.0, 555.8), &mk(229.0, 542.2), 1.5));
         // Same-baseline column transition (end of col 1 → top-ish of col 2 at
         // the same Y, y_drop ≈ 0). IS a column boundary.
-        assert!(is_column_gap(&mk(976.7, 1013.2), &mk(192.6, 1011.7)));
+        assert!(is_column_gap(&mk(976.7, 1013.2), &mk(192.6, 1011.7), 1.5));
         // Column jump UP (next column resumes far above). IS a column boundary.
-        assert!(is_column_gap(&mk(500.0, 100.0), &mk(72.0, 700.0)));
+        assert!(is_column_gap(&mk(500.0, 100.0), &mk(72.0, 700.0), 1.5));
+        // A double-spaced wrap from an indented first line (drop 2.4 font
+        // sizes) is a wrap on a page whose measured gap ratio covers it, and
+        // a column jump on a single-spaced page.
+        assert!(!is_column_gap(&mk(123.9, 526.1), &mk(76.9, 494.9), 3.0));
+        assert!(is_column_gap(&mk(123.9, 526.1), &mk(76.9, 494.9), 1.5));
     }
 
     /// Right-to-left flow steps left on every word, including across the space
@@ -3962,8 +3980,8 @@ mod tests {
         let word_r = mk("\u{05D0}\u{05D1}", 300.0);
         let space = mk(" ", 290.0);
         let word_l = mk("\u{05D2}\u{05D3}", 250.0);
-        assert!(!is_column_gap(&word_r, &space), "RTL word→space read as a column gap");
-        assert!(!is_column_gap(&space, &word_l), "RTL space→word read as a column gap");
+        assert!(!is_column_gap(&word_r, &space, 1.5), "RTL word→space read as a column gap");
+        assert!(!is_column_gap(&space, &word_l, 1.5), "RTL space→word read as a column gap");
     }
 
     /// D5c RED — multi-column newspaper case. Two text spans on the

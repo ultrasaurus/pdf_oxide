@@ -60,11 +60,15 @@ impl HtmlOutputConverter {
         span.span.is_italic
     }
 
-    /// Detect paragraph breaks between spans based on vertical spacing.
-    fn is_paragraph_break(&self, current: &OrderedTextSpan, previous: &OrderedTextSpan) -> bool {
-        let line_height = current.span.font_size.max(previous.span.font_size);
-        let gap = (previous.span.bbox.y - current.span.bbox.y).abs();
-        gap > line_height * self.paragraph_gap_ratio
+    /// Detect paragraph breaks between spans based on vertical spacing, with
+    /// the page's `gap_ratio` from [`super::paragraph_gap_ratio`].
+    fn is_paragraph_break(
+        &self,
+        current: &OrderedTextSpan,
+        previous: &OrderedTextSpan,
+        gap_ratio: f32,
+    ) -> bool {
+        super::exceeds_paragraph_gap(current, previous, gap_ratio, self.paragraph_gap_ratio)
     }
 
     /// Detect if span should be a heading based on font size and content heuristics.
@@ -414,6 +418,8 @@ impl HtmlOutputConverter {
 
         // Calculate base font size for heading detection (shared with markdown).
         let base_font_size = super::base_heading_font_size(&sorted, config.output.detect_headings);
+        let gap_ratio = super::paragraph_gap_ratio(&sorted, self.paragraph_gap_ratio);
+        let indent_starts = super::first_line_indent_starts(&sorted);
 
         // Track which tables have been rendered
         let mut tables_rendered = vec![false; tables.len()];
@@ -464,7 +470,7 @@ impl HtmlOutputConverter {
             *in_p = false;
         };
 
-        for span in &sorted {
+        for (span_idx, span) in sorted.iter().enumerate() {
             let text_raw = span.span.text.as_str();
 
             // Check if span is in a table region
@@ -598,7 +604,8 @@ impl HtmlOutputConverter {
 
             // Check for paragraph break
             if let Some(prev) = prev_span {
-                if self.is_paragraph_break(span, prev)
+                if (self.is_paragraph_break(span, prev, gap_ratio)
+                    || indent_starts.contains(&span_idx))
                     && in_paragraph
                     && !current_content.is_empty()
                 {

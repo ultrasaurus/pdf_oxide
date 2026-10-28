@@ -26,11 +26,15 @@ impl PlainTextConverter {
         }
     }
 
-    /// Detect paragraph breaks between spans based on vertical spacing.
-    fn is_paragraph_break(&self, current: &OrderedTextSpan, previous: &OrderedTextSpan) -> bool {
-        let line_height = current.span.font_size.max(previous.span.font_size);
-        let gap = (previous.span.bbox.y - current.span.bbox.y).abs();
-        gap > line_height * self.paragraph_gap_ratio
+    /// Detect paragraph breaks between spans based on vertical spacing, with
+    /// the page's `gap_ratio` from [`super::paragraph_gap_ratio`].
+    fn is_paragraph_break(
+        &self,
+        current: &OrderedTextSpan,
+        previous: &OrderedTextSpan,
+        gap_ratio: f32,
+    ) -> bool {
+        super::exceeds_paragraph_gap(current, previous, gap_ratio, self.paragraph_gap_ratio)
     }
 }
 
@@ -403,6 +407,8 @@ impl PlainTextConverter {
         // different reading-order groups (they would otherwise be separated).
         // Only applies when columnar reordering didn't already handle the spans.
         Self::merge_same_y_across_groups(&mut sorted, &columnar_indices);
+        let gap_ratio = super::paragraph_gap_ratio(&sorted, self.paragraph_gap_ratio);
+        let indent_starts = super::first_line_indent_starts(&sorted);
 
         let mut tables_rendered = vec![false; tables.len()];
         // Pre-render table text so we can check for orphaned spans.
@@ -446,9 +452,13 @@ impl PlainTextConverter {
                 let in_columnar = columnar_indices.contains(&span_idx);
                 let y_diff = (span.span.bbox.y - prev.span.bbox.y).abs();
                 let same_y = y_diff < span.span.font_size.max(1.0) * 0.5;
-                let group_changed = if in_columnar || same_y {
-                    false // suppress group-change breaks for reordered columnar spans
-                          // and for spans at the same Y-position (merged across groups)
+                let group_changed = if in_columnar
+                    || same_y
+                    || super::is_wide_pitch_wrap(prev, span, gap_ratio, self.paragraph_gap_ratio)
+                {
+                    false // suppress group-change breaks for reordered columnar spans,
+                          // for spans at the same Y-position (merged across groups),
+                          // and for the next line of a widely spaced column
                 } else {
                     match (span.group_id, prev.group_id) {
                         (Some(a), Some(b)) => a != b,
@@ -456,7 +466,10 @@ impl PlainTextConverter {
                     }
                 };
 
-                if group_changed || self.is_paragraph_break(span, prev) {
+                if group_changed
+                    || self.is_paragraph_break(span, prev, gap_ratio)
+                    || indent_starts.contains(&span_idx)
+                {
                     result.push_str("\n\n");
                 } else {
                     let same_line = same_y;
